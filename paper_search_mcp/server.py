@@ -16,6 +16,7 @@ from .academic_platforms.iacr import IACRSearcher
 from .academic_platforms.semantic import SemanticSearcher
 from .academic_platforms.crossref import CrossRefSearcher
 from .academic_platforms.openalex import OpenAlexSearcher
+from .academic_platforms.opencitations import OpenCitationsSearcher
 from .academic_platforms.pmc import PMCSearcher
 from .academic_platforms.core import CORESearcher
 from .academic_platforms.europepmc import EuropePMCSearcher
@@ -30,6 +31,7 @@ from .academic_platforms.zenodo import ZenodoSearcher
 from .academic_platforms.hal import HALSearcher
 from .academic_platforms.ssrn import SSRNSearcher
 from .utils import extract_doi
+from .citation_cross_check import cross_check_citations as _cross_check_citations
 
 # from .academic_platforms.hub import SciHubSearcher
 from .paper import Paper
@@ -48,6 +50,7 @@ iacr_searcher = IACRSearcher()
 semantic_searcher = SemanticSearcher()
 crossref_searcher = CrossRefSearcher()
 openalex_searcher = OpenAlexSearcher()
+opencitations_searcher = OpenCitationsSearcher()
 pmc_searcher = PMCSearcher()
 core_searcher = CORESearcher()
 europepmc_searcher = EuropePMCSearcher()
@@ -875,6 +878,116 @@ async def search_openalex(query: str, max_results: int = 10) -> List[Dict]:
     """
     papers = await async_search(openalex_searcher, query, max_results)
     return papers if papers else []
+
+
+# ---------------------------------------------------------------------------
+# Citation cascade tools (backward/forward traversal, one hop) — see
+# paper_search_mcp-cascade-SPEC.md. Multi-hop cascade recursion is out of
+# scope here by design; it belongs in the calling skill, not the server.
+# ---------------------------------------------------------------------------
+@mcp.tool()
+async def resolve_openalex_work(identifier: str) -> str:
+    """Resolve a DOI, OpenAlex work ID, or OpenAlex URL to a canonical OpenAlex work ID.
+
+    Every other citation-cascade tool depends on this normalization.
+
+    Args:
+        identifier: A DOI (e.g. '10.1016/0047-2727(72)90010-2' or 'doi:10.xxx' or
+            'https://doi.org/10.xxx'), an OpenAlex work ID (e.g. 'W2088435028'),
+            or an OpenAlex URL.
+    Returns:
+        str: Canonical OpenAlex work ID (e.g. 'W2088435028').
+    Raises:
+        ValueError: If the identifier cannot be resolved to a work.
+    """
+    return await asyncio.to_thread(openalex_searcher.resolve_work, identifier)
+
+
+@mcp.tool()
+async def get_openalex_references(work_id: str) -> Dict[str, Any]:
+    """Backward citation traversal: resolve a work's referenced_works to full papers.
+
+    Args:
+        work_id: DOI, OpenAlex work ID, or OpenAlex URL (resolved internally).
+    Returns:
+        Dict with 'work_id', 'ids' (referenced OpenAlex work IDs), and 'papers'
+        (full paper metadata for each reference). Empty 'ids'/'papers' means the
+        work genuinely has no recorded references, not an error.
+
+    Note: OpenAlex's reference-list coverage is weak for pre-digital work —
+    a 1972 anchor paper used to validate this tool has only 6 recorded
+    references despite a longer printed bibliography. Report this caveat
+    when a cascade seed predates ~1990.
+    """
+    result = await asyncio.to_thread(openalex_searcher.get_work_references, work_id)
+    return {
+        "work_id": result.work_id,
+        "ids": result.ids,
+        "papers": [paper.to_dict() for paper in result.papers],
+    }
+
+
+@mcp.tool()
+async def get_openalex_citations(
+    work_id: str, max_results: int = 200, cursor: Optional[str] = None
+) -> Dict[str, Any]:
+    """Forward citation traversal: works that cite `work_id`, cursor-paginated.
+
+    Args:
+        work_id: DOI, OpenAlex work ID, or OpenAlex URL (resolved internally).
+        max_results: Maximum citer IDs to retrieve this call (default: 200).
+            A single work can have thousands of citers; this paginates
+            internally via OpenAlex's cursor, not its capped page= parameter.
+        cursor: Resume token from a previous call's 'next_cursor', to continue
+            paginating past `max_results` across multiple calls. Omit to start fresh.
+    Returns:
+        Dict with 'work_id', 'ids' (citer OpenAlex work IDs), 'count' (OpenAlex's
+        own total for this edge — treat as approximate, see note), 'next_cursor'
+        (pass back in to continue), and 'exhausted' (true if there are no more pages).
+
+    Note: OpenAlex's own citation count for the same work has been observed to
+    differ between two calls minutes apart, and to diverge from
+    OpenCitations' count for the same edge by ~40% — use cross_check_citations
+    to see both. Never treat 'count' as exact; treat it as an order of magnitude.
+    """
+    result = await asyncio.to_thread(
+        openalex_searcher.get_work_citations, work_id, max_results, cursor
+    )
+    return {
+        "work_id": result.work_id,
+        "ids": result.ids,
+        "count": result.count,
+        "next_cursor": result.next_cursor,
+        "exhausted": result.exhausted,
+    }
+
+
+@mcp.tool()
+async def cross_check_citations(doi: str) -> Dict[str, Any]:
+    """Cross-check a work's forward-citation count between OpenAlex and OpenCitations.
+
+    The two indices disagree, sometimes substantially, and must not be
+    silently merged into one number (SPEC §3.2). If one source errors, the
+    other's result is still returned — partial success stays visible as partial.
+
+    Args:
+        doi: The work's DOI (e.g. '10.1016/0047-2727(72)90010-2').
+    Returns:
+        Dict with 'doi', 'openalex_count', 'openalex_error', 'opencitations_count',
+        'opencitations_error', and 'delta' (openalex_count - opencitations_count,
+        or null if either source failed).
+    """
+    result = await asyncio.to_thread(
+        _cross_check_citations, doi, openalex_searcher, opencitations_searcher
+    )
+    return {
+        "doi": result.doi,
+        "openalex_count": result.openalex_count,
+        "openalex_error": result.openalex_error,
+        "opencitations_count": result.opencitations_count,
+        "opencitations_error": result.opencitations_error,
+        "delta": result.delta,
+    }
 
 
 @mcp.tool()

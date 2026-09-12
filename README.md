@@ -13,6 +13,7 @@ A Model Context Protocol (MCP) server for searching and downloading academic pap
 - [Project Principles](#project-principles)
 - [Features](#features)
 - [Source Strategy](#source-strategy)
+- [Citation Cascade (Backward/Forward Traversal)](#citation-cascade-backwardforward-traversal)
 - [Sci-Hub Notice](#sci-hub-notice)
 - [Installation](#installation)
   - [Claude Code (Skill)](#claude-code-skill--recommended-for-claude-code-users)
@@ -125,6 +126,7 @@ All keys are **optional** unless noted. Configure them in `~/.config/paper-searc
 | `PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN` | Zenodo | Optional | Free at [zenodo.org](https://zenodo.org/account/settings/applications/) — required for private records |
 | `PAPER_SEARCH_MCP_IEEE_API_KEY` | IEEE Xplore | **Required to activate** | Free at [developer.ieee.org](https://developer.ieee.org/) |
 | `PAPER_SEARCH_MCP_ACM_API_KEY` | ACM DL | **Required to activate** | See [libraries.acm.org/digital-library/acm-open](https://libraries.acm.org/digital-library/acm-open) |
+| `PAPER_SEARCH_MCP_OPENALEX_EMAIL` | OpenAlex | Optional | Any valid email — enters OpenAlex's "polite pool" for better rate limits. No account needed. |
 
 All variables follow the `PAPER_SEARCH_MCP_<NAME>` prefix scheme. Legacy names without the prefix (e.g. `CORE_API_KEY`, `UNPAYWALL_EMAIL`) are still supported for backward compatibility.
 
@@ -177,6 +179,26 @@ Three additional free-source connectors are now integrated into the MCP server:
 - `unpaywall`: DOI-centric OA metadata source for standalone lookup (`search_unpaywall`) and fallback URL resolution.
 
 SSRN integration remains compliance-first: it only attempts direct public PDF links exposed by SSRN pages. If login/restricted delivery is required, the connector returns a clear message instead of bypassing access controls.
+
+## Citation Cascade (Backward/Forward Traversal)
+
+Upstream `paper-search-mcp` cannot traverse citation graphs — no adapter requests a reference list or a citing-works list, even though `Paper.references` has existed unused since the original schema. This fork adds one-hop bidirectional traversal on OpenAlex, plus an OpenCitations cross-check, so a caller (e.g. a citation-cascade skill) can walk backward and forward from a seed paper. Multi-hop recursion is intentionally **not** built into the server — it belongs in the calling agent/skill, not here.
+
+**Tools** (all built on OpenAlex, no API key required):
+
+| Tool | Direction | What it does |
+|---|---|---|
+| `resolve_openalex_work(identifier)` | — | Normalizes a DOI, OpenAlex ID, or OpenAlex URL to a canonical work ID. Every other tool below depends on this. |
+| `get_openalex_references(work_id)` | Backward | Resolves a work's `referenced_works` to full paper metadata. |
+| `get_openalex_citations(work_id, max_results, cursor)` | Forward | Works citing `work_id`, cursor-paginated past OpenAlex's 200-per-page cap. |
+| `cross_check_citations(doi)` | — | Queries OpenAlex **and** OpenCitations for the same work and reports both counts plus their delta. |
+
+`search_openalex` and the other search tools now also populate `references` on returned papers (previously always empty).
+
+**Coverage caveats — report these, don't hide them:**
+
+- **Citation indices disagree with each other, and with themselves.** For a 1972 tax-compliance paper used to validate this fork, OpenAlex reported 4959 forward citers via one endpoint and 4947 via another, *minutes apart*; OpenCitations reported 2919 for the same edge — a ~40% divergence from OpenAlex. A citation count is a property of the index that produced it, not a ground truth. Never treat any single count as exact; use `cross_check_citations` when the number matters.
+- **Backward coverage degrades sharply with age.** That same 1972 paper has only 6 recorded `referenced_works` in OpenAlex despite a longer printed bibliography, and Semantic Scholar's reference list for it is elided entirely at the publisher's request (`"data": null`) — which is why Semantic Scholar is not used as a backward source here. Any cascade seeded on pre-digital or non-English literature will be systematically incomplete in a direction correlated with age, discipline, and publisher. This fork makes that gap visible; it cannot close it.
 
 ## Sci-Hub Notice
 
